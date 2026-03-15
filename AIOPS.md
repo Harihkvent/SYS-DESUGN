@@ -1,0 +1,491 @@
+# AI Log Analyzer — Low-Level Design (LLD)
+
+**Purpose:** A clear, implementation-ready LLD for a production-capable AI Log Analyzer (AIOps) that two engineers can build, maintain, and extend. The document is modular so features can be added or removed with minimal friction. Use this as the working design for implementation and for import into design tools like app.eraser.io.
+
+---
+
+## Table of contents
+
+1. Overview
+2. Goals & non-goals
+3. High level modules
+4. Component diagrams (Mermaid)
+5. Data model
+6. APIs (gateway + internal)
+7. Core classes & interfaces (per module)
+8. Storage & retention design
+9. AI/ML & LLM integration patterns
+10. Deployment & infra (K8s, CI/CD)
+11. Observability, testing & reliability
+12. Security & multi-tenant considerations
+13. Extensibility & plugin architecture
+14. Feature list (max features) + gradual implementation roadmap
+15. Coding style, repo & folder structure
+16. Appendix: example manifests & quick-start
+
+---
+
+## 1. Overview
+
+An event-driven system that ingests logs from many sources, processes and enriches them, runs ML/LLM-based analysis (anomaly detection, clustering, root-cause suggestions), and surfaces results in a dashboard and alerting destinations.
+
+Key qualities: modular, observable, horizontally scalable, AI-fail-safe (system functions without AI), pluggable components.
+
+## 2. Goals & non-goals
+
+**Goals**
+
+* Real-time ingestion (near real-time, < few seconds latency for pipelines)
+* Accurate anomaly detection + grouping within minutes
+* LLM-assisted RCA and summarization
+* Minimal ops for running a dev environment (docker-compose) and full production on K8s
+* Extensible plugin system for new parsers, detectors, alert destinations
+
+**Non-goals (for v1)**
+
+* Full enterprise multi-region long-term cold storage (we provide hooks)
+* Replacing established observability platforms — we integrate with them
+
+## 3. High level modules
+
+```
+frontend (dashboard)
+api-gateway
+ingestion-service
+message-broker (Kafka/Redpanda)
+processing-service(s)
+ai-engine (ML + LLM agents)
+vector-store + search
+storage (Elasticsearch / ClickHouse / S3)
+alert-service
+auth & config service
+monitoring & tracing
+```
+
+Each module can be deployed as separate K8s deployments; for early dev they can run as processes with docker-compose.
+
+## 4. Component diagrams (Mermaid)
+
+### 4.1. System architecture
+
+```mermaid
+flowchart LR
+  subgraph Sources
+    A[Applications] -->|Fluent Bit / Fluentd / Beats| B[Ingest Receiver]
+    C[Containers / K8s] -->|Sidecar / Daemonset| B
+    D[Cloud Logs] -->|Cloud Forwarder| B
+  end
+
+  B --> E[Message Broker<br>Kafka / Redpanda]
+  E --> F[Processing Service]
+  F --> G[AI Engine]
+  F --> H[Storage<br>Elasticsearch / ClickHouse]
+  G --> H
+  G --> I[Vector DB<br>Qdrant / Milvus]
+  I --> J[LLM Agents / Agent Orchestrator]
+  J --> K[Alert Service]
+  K --> L[Destinations<br>Slack / PagerDuty / Email / Jira]
+  H --> M[Dashboard / API Gateway]
+  M --> N[Frontend]
+  M --> O[Auth Service]
+
+```
+
+### 4.2. Sequence: ingest -> detect -> alert
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Ingest
+    participant Broker
+    participant Processor
+    participant AI
+    participant Store
+    participant Alert
+
+    App->>Ingest: push log
+    Ingest->>Broker: publish(topic=raw-logs)
+    Broker->>Processor: consume
+    Processor->>AI: features / batch
+    AI-->>Processor: anomaly? cluster_id
+    Processor->>Store: write enriched events
+    AI->>Alert: create alert if severity
+    Alert->>Dest: notify
+```
+
+### 4.3. Component relationship (class-level)
+
+```mermaid
+classDiagram
+    class LogReceiver{
+      +receive(raw)
+      +validate()
+      +publish()
+    }
+    class LogParser{
+      +parse()
+      +extract()
+    }
+    class FeatureExtractor{
+      +extract_features()
+    }
+    class AnomalyDetector{
+      +detect()
+    }
+    class Clusterer{
+      +cluster()
+    }
+    LogReceiver <|-- LogParser
+    LogParser <|-- FeatureExtractor
+    FeatureExtractor <|-- AnomalyDetector
+    AnomalyDetector <|-- Clusterer
+```
+
+## 5. Data model
+
+Normalized SQL-like models and schemaless raw store for logs.
+
+**Raw logs (immutable)**
+
+* id (uuid)
+* received_at (timestamp)
+* source (string)
+* raw (json/blob)
+
+**Normalized logs**
+
+* id, timestamp, service, host, level, trace_id, span_id, message, parsed_fields (json), embeddings_id
+
+**Features**
+
+* log_id, window_start, error_count, rate, metric_vectors, embedding_id
+
+**Clusters / incidents / anomalies**
+
+* id, cluster_signature, created_at, severity, affected_services[], evidence (references to normalized logs), rca_summary, status
+
+## 6. APIs (gateway + internal)
+
+### Public API (HTTP / GraphQL)
+
+* `POST /v1/logs` — lightweight ingestion (for quick tests)
+* `GET /v1/logs?service=&from=&to=&q=` — log explorer
+* `GET /v1/anomalies?service=&status=` — anomalies list
+* `GET /v1/incidents/{id}` — incident detail
+* `POST /v1/query` — natural language query -> LLM response
+* `POST /v1/alerts/test` — test alert send
+
+### Internal/Service APIs (gRPC recommended)
+
+* `Ingest.Publish(topic, payload)`
+* `Processor.FetchBatch(topic, partition)`
+* `AI.AnalyzeBatch(batch_id)`
+
+**API contract notes**
+
+* Use protobuf/gRPC for internal services to keep stable contracts and efficient binary transfer
+* API gateway handles auth (JWT/OAuth) and throttling
+
+## 7. Core classes & interfaces (per module)
+
+### 7.1 Ingestion
+
+```python
+class ILogReceiver:
+    def receive(self, raw: str) -> dict: ...
+
+class LogValidator:
+    def validate(self, log: dict) -> bool: ...
+
+class LogPublisher:
+    def publish(self, topic: str, message: dict): ...
+```
+
+### 7.2 Processing
+
+```python
+class LogConsumer:
+    def consume(self): ...
+
+class LogNormalizer:
+    def normalize(self, raw: dict) -> dict: ...
+
+class FeatureExtractor:
+    def extract(self, normalized: dict) -> dict: ...
+```
+
+### 7.3 AI Engine
+
+```python
+class EmbeddingGenerator:
+    def embed(self, text: str) -> List[float]: ...
+
+class AnomalyDetector:
+    def detect(self, features_batch: list) -> List[Anomaly]: ...
+
+class Clusterer:
+    def cluster(self, logs: list) -> ClusterResult: ...
+
+class RCAAgent:
+    def explain(self, cluster: ClusterResult) -> str: ...
+```
+
+Design the AI interfaces so models can be replaced (local model / hosted LLM / inference microservice).
+
+## 8. Storage & retention design
+
+* **Hot store (short-term, high-cardinality):** Elasticsearch / ClickHouse for fast queries (retain 7-30 days depending on plan)
+* **Cold store (long-term):** S3 / object store with partitioning by date + service
+* **Embeddings/Vector DB:** Qdrant / Milvus for similarity search (store only recent window, or metadata pointer to S3 for cold logs)
+* **Metadata DB:** Postgres for config, incidents, users
+
+**Retention policy**
+
+* Raw logs -> hot (14 days) -> cold (S3) -> delete after X months
+* Aggregates & incidents -> keep for longer in Postgres
+
+## 9. AI/ML & LLM integration patterns
+
+**Two-layer AI design** (recommended):
+
+1. **Classical ML / streaming detectors** for fast, deterministic anomaly detection (e.g., e.g., EWMA, Holt-Winters, Isolation Forest over features)
+2. **LLM / Agentic layer** for explanation, RCA, summarization and guided queries
+
+**Embedding flow**
+
+* On normalized message, compute an embedding (text + key fields)
+* Store embedding in vector DB with metadata (timestamp, log_id, service)
+
+**LLM usage patterns**
+
+* Short, context-rich prompts with a *slice* of evidence logs (limit tokens). Include structured metadata and top-n embeddings
+* Keep "LLM replay logs" for auditability
+
+**Agent orchestration**
+
+* Use a small orchestrator (LangGraph / custom) that runs the RCAAgent pipeline: find top-k related logs via vector DB → run few-shot prompt → synthesize result → attach to incident
+
+**Fallbacks & safety**
+
+* LLM outputs must be accompanied by evidence references (log ids). Mark uncertain statements with a confidence score and a "verify" flag.
+
+## 10. Deployment & infra (K8s, CI/CD)
+
+**Kubernetes** recommended for production. Minimal production components:
+
+* K8s cluster (managed: EKS/GKE/AKS) or self-managed
+* Kafka / Redpanda (statefulset) or managed (MSK/CloudPubSub)
+* Vector DB (stateful)
+* Elasticsearch or ClickHouse
+* Postgres (stateful)
+* Redis (for rate-limiting, caches)
+
+**CI/CD**
+
+* GitHub Actions / GitLab CI
+* Build images per service + push (tag: commit SHA)
+* Helm charts / Kustomize for deployments
+* Canary rollouts via Argo Rollouts or K8s deployments (maxUnavailable/strategy)
+
+**Example K8s patterns**
+
+* Deploy AI Engine as a deployment with GPU nodes optional
+* Use HorizontalPodAutoscaler (HPA) based on CPU and custom metrics (e.g., consumer lag)
+* Use PodDisruptionBudgets for stateful services
+
+**Secrets & config**
+
+* Use Kubernetes Secrets / Vault for keys
+
+## 11. Observability, testing & reliability
+
+**Observability**
+
+* Distributed tracing (OpenTelemetry): instrument ingestion -> processing -> AI calls
+* Metrics: Prometheus + Grafana
+* Logs: aggregate service logs into the same system (separate index)
+* Healthchecks + readiness/liveness
+
+**Testing**
+
+* Unit tests for parsers, features
+* Integration tests: run local Kafka + ES using testcontainers or docker-compose
+* E2E tests: ingest simulated traffic and validate alerts
+
+**Reliability**
+
+* Consumer groups for processing scale
+* Exactly-once or at-least-once semantics design (idempotency keys in writes)
+* Backpressure handling: when AI is slow, persist enriched events and mark for async analysis
+
+## 12. Security & multi-tenant considerations
+
+**Auth & Authorization**
+
+* API: JWT with scopes
+* RBAC for dashboard and incident actions
+
+**Data isolation**
+
+* Tenant id per log; query layer enforces tenant filter
+* Optionally namespace K8s resources per tenant for enterprise
+
+**Encryption**
+
+* TLS in transit
+* Server-side encryption for S3
+
+**Compliance**
+
+* PII redaction pipeline stage (plugin) — configurable patterns
+
+## 13. Extensibility & plugin architecture
+
+Design every extension point as a plugin interface.
+
+**Extension points**
+
+* Parsers (for service log formats)
+* Feature extractors
+* Anomaly detectors
+* Alert destinations
+* LLM prompt templates
+
+**Plugin design**
+
+* Each plugin is a Dockerized microservice that registers with config service (or via file config)
+* Use standardized interface (gRPC + protobuf) with versions
+
+**Plugin discovery**
+
+* Config service keeps plugin registry
+* Plugins expose health + metadata endpoints
+
+**Feature toggles**
+
+* Use a feature-flag system (unleash / simple toggles) for safe rollouts and to enable/disable heavy LLM features per tenant
+
+## 14. Feature list (max features) + gradual implementation roadmap
+
+**Max features (catalog)**
+
+* Ingestion: Fluent Bit/Beats support, cloud forwarders, sidecar daemonset
+* Parsing: JSON, regex, structured parsers, automatic field discovery
+* Streaming: Kafka/Redpanda, retry and DLQ
+* Processing: normalization, enrichment (geo, user-agent), dedup
+* AI: embeddings, vector search, anomaly detection (stat + ML), clustering
+* LLM: RCA agent, summarization, natural-language query, proactive incident suggestions
+* UI: log explorer, anomaly dashboard, incident timeline, RCA panel, query chat
+* Alerting: Slack, Email, PagerDuty, Jira create
+* Multi-tenancy: tenant isolation, quotas
+* Data lifecycle: hot/cold storage, rehydration
+* Security: PII redaction, audit logs
+* Extensibility: plugin marketplace, integrations (Prometheus, Jaeger)
+
+**Roadmap (two-person, 3-4 month realistic plan)**
+
+**Sprint 0 (week 0) — project setup**
+
+* Repo, CI, basic docker-compose, dev scripts, README
+* Basic infra templates (k8s helm skeleton)
+
+**Sprint 1 (weeks 1–3) — MVP ingestion & processing**
+
+* Fluent-bit -> local Kafka -> Processor normalizer -> ES
+* Simple dashboard: log explorer (frontend minimal)
+
+**Sprint 2 (weeks 4–6) — anomaly detection (streaming)**
+
+* Implement simple rate-based detectors + alerts to Slack
+* Persist anomalies & basic incident model
+
+**Sprint 3 (weeks 7–9) — clustering & vector store**
+
+* Add embedding generation + Qdrant
+* Implement simple clustering and UI to view clusters
+
+**Sprint 4 (weeks 10–12) — LLM RCA & summarization**
+
+* Build LLM agent that uses top-k embeddings + few-shot prompt
+* Show RCA in incident panel
+
+**Sprint 5 (weeks 13–16) — polish & extensibility**
+
+* Plugin interfaces, feature flags, auth
+* Hardening, tests, monitoring
+
+Optional stretch: deploy to cloud, offer docker images and Helm charts, make a "lite" hosted demo
+
+## 15. Coding style, repo & folder structure
+
+**Monorepo (recommended for two devs)**
+
+```
+ai-log-analyzer/
+  backend/
+    ingestion/
+    processing/
+    ai_engine/
+    alerts/
+    api/
+  frontend/
+    dashboard/
+  infra/
+    k8s/
+    helm/
+    docker-compose.yml
+  docs/
+  scripts/
+  tests/
+```
+
+**Language choices**
+
+* Backend: Python (async) or Go (performance) — Python is faster to iterate with ML libraries
+* Frontend: React + Vite + Tailwind
+* AI: Python microservices to use existing ML/LLM libs
+
+## 16. Appendix: example manifests & quick-start
+
+**docker-compose (dev) skeleton**
+
+```yaml
+version: '3.8'
+services:
+  zookeeper: {}
+  kafka: {}
+  qdrant: {}
+  elasticsearch: {}
+  ingestion:
+    build: ./backend/ingestion
+    command: python receiver.py
+  processor:
+    build: ./backend/processing
+    command: python consumer.py
+  ai-engine:
+    build: ./backend/ai_engine
+    command: python ai_engine.py
+  frontend:
+    build: ./frontend
+    command: npm run dev
+```
+
+**Kubernetes: short notes**
+
+* Create namespaces: `ai-log-analyzer`, `ingest`, `data`
+* Deploy statefulsets for Kafka and Qdrant
+* Use persistent volumes for ES and Postgres
+
+---
+
+### Closing notes
+
+This LLD is intentionally pragmatic: start small, keep AI as an augment, make each module replaceable. Use the plugin interfaces so new detectors, LLM providers, or parsers can be added without touching the core pipeline.
+
+If you want, I can:
+
+* Generate the corresponding HLD (networking, capacity numbers, cost estimates)
+* Produce ready-to-run `docker-compose.yml` and basic Helm charts for Sprints 0–1
+* Scaffold code stubs for each module in Python/Go
+
+Which of those should I build next?
