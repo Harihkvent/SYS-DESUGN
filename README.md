@@ -2,6 +2,20 @@
 
 An event-driven AI-powered log analysis system that ingests logs from multiple sources, detects anomalies, and surfaces insights via a real-time dashboard.
 
+## Screenshots
+
+### Overview Dashboard
+![Overview Dashboard](ai-log-analyzer/docs/screenshots/01-dashboard.png)
+
+### Log Explorer
+![Log Explorer](ai-log-analyzer/docs/screenshots/02-log-explorer.png)
+
+### Anomalies
+![Anomalies](ai-log-analyzer/docs/screenshots/03-anomalies.png)
+
+### Natural Language Query
+![NL Query](ai-log-analyzer/docs/screenshots/04-nl-query.png)
+
 ---
 
 ## Architecture
