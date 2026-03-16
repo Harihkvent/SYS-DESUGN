@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from confluent_kafka import Producer, KafkaException
 import uvicorn
 
@@ -56,24 +56,26 @@ VALID_LEVELS = {"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL", "FATAL"
 class LogEntry(BaseModel):
     source: str = Field(..., min_length=1, description="Log source system")
     message: str = Field(..., min_length=1, description="Log message text")
-    level: str = Field(..., description="Log level: DEBUG/INFO/WARN/ERROR/CRITICAL")
+    level: str = Field(..., description="Log level: DEBUG/INFO/WARN/ERROR/CRITICAL/FATAL")
     timestamp: Optional[str] = Field(None, description="ISO-8601 timestamp; defaults to now")
     service: str = Field(..., min_length=1, description="Originating service name")
     host: str = Field(..., min_length=1, description="Host or pod name")
     extra_fields: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-    @validator("level")
+    @field_validator("level")
+    @classmethod
     def validate_level(cls, v: str) -> str:
         upper = v.upper()
         if upper not in VALID_LEVELS:
             raise ValueError(f"level must be one of {VALID_LEVELS}, got '{v}'")
         return upper
 
-    @validator("timestamp", pre=True, always=True)
-    def default_timestamp(cls, v: Optional[str]) -> str:
-        if v is None:
-            return datetime.now(timezone.utc).isoformat()
-        return v
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_timestamp(cls, data: Any) -> Any:
+        if isinstance(data, dict) and not data.get("timestamp"):
+            data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        return data
 
 
 class IngestResponse(BaseModel):
@@ -83,7 +85,7 @@ class IngestResponse(BaseModel):
 
 def _publish_entry(producer: Producer, entry: LogEntry) -> str:
     log_id = str(uuid.uuid4())
-    payload = entry.dict()
+    payload = entry.model_dump()
     payload["id"] = log_id
     producer.produce(
         KAFKA_TOPIC,
@@ -111,6 +113,8 @@ async def ingest(body: Union[LogEntry, List[LogEntry]]):
         log_id = _publish_entry(producer, entry)
         ids.append(log_id)
 
+    # Non-blocking poll to trigger asynchronous delivery callbacks without blocking the HTTP response.
+    # Actual delivery confirmation happens in the background via delivery_callback.
     producer.poll(0)
     return IngestResponse(accepted=len(ids), ids=ids)
 
