@@ -1,0 +1,177 @@
+version: "3.9"
+
+networks:
+  aiops-network:
+    driver: bridge
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    networks:
+      - aiops-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -v '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - aiops-network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - aiops-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - aiops-network
+
+  ingestion:
+    build:
+      context: ../backend/ingestion
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_TOPIC=raw-logs
+    ports:
+      - "8001:8001"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+  processing:
+    build:
+      context: ../backend/processing
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_TOPIC=raw-logs
+      - KAFKA_GROUP_ID=processing-service
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+  ai-engine:
+    build:
+      context: ../backend/ai_engine
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - ANOMALY_ERROR_THRESHOLD=10
+      - POLL_INTERVAL_SECONDS=30
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+  alerts:
+    build:
+      context: ../backend/alerts
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - POLL_INTERVAL_SECONDS=30
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../backend/api
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    ports:
+      - "8000:8000"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend/dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    networks:
+      - aiops-network
+    restart: unless-stopped
+
+volumes:
+  es-data:
+  qdrant-data:
