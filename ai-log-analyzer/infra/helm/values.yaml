@@ -1,0 +1,79 @@
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+elasticsearch:
+  image: docker.elastic.co/elasticsearch/elasticsearch
+  tag: "8.11.0"
+  replicas: 1
+  javaOpts: "-Xms512m -Xmx512m"
+  storage: 10Gi
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+kafka:
+  image: confluentinc/cp-kafka
+  tag: "7.5.0"
+  replicas: 1
+  storage: 10Gi
+
+zookeeper:
+  image: confluentinc/cp-zookeeper
+  tag: "7.5.0"
+  replicas: 1
+
+ingestion:
+  image: ai-log-analyzer/ingestion
+  tag: latest
+  replicas: 2
+  port: 8001
+  kafka:
+    bootstrapServers: "kafka:29092"
+    topic: "raw-logs"
+
+processing:
+  image: ai-log-analyzer/processing
+  tag: latest
+  replicas: 2
+  kafka:
+    bootstrapServers: "kafka:29092"
+    topic: "raw-logs"
+    groupId: "processing-service"
+
+aiEngine:
+  image: ai-log-analyzer/ai-engine
+  tag: latest
+  replicas: 1
+  anomalyErrorThreshold: 10
+  pollIntervalSeconds: 30
+
+alerts:
+  image: ai-log-analyzer/alerts
+  tag: latest
+  replicas: 1
+  pollIntervalSeconds: 30
+  slack:
+    webhookUrl: ""
+
+api:
+  image: ai-log-analyzer/api
+  tag: latest
+  replicas: 2
+  port: 8000
+
+frontend:
+  image: ai-log-analyzer/frontend
+  tag: latest
+  replicas: 2
+  port: 80
+
+ingress:
+  enabled: false
+  className: nginx
+  host: aiops.example.com
+  tls: false

@@ -1,0 +1,15 @@
+apiVersion: v2
+name: ai-log-analyzer
+description: AI-powered log analysis and anomaly detection system
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - aiops
+  - logging
+  - anomaly-detection
+  - elasticsearch
+  - kafka
+maintainers:
+  - name: Platform Team
+    email: platform@example.com
